@@ -4,7 +4,6 @@ import json
 import time
 import uuid
 import subprocess
-import re
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -38,7 +37,7 @@ CORS(app)
 # ======================================================
 # GEMINI CONFIG
 # ======================================================
-GEMINI_API_KEY = "YOUR_API_KEY_HERE"
+GEMINI_API_KEY = "YOUR_API_KEY"
 genai.configure(api_key=GEMINI_API_KEY)
 
 model = genai.GenerativeModel(
@@ -52,10 +51,9 @@ model = genai.GenerativeModel(
 )
 
 # ======================================================
-# UTILS
+# RATE LIMIT
 # ======================================================
 _LAST_CALL = 0
-
 
 def rate_limit(min_interval=0.7):
     global _LAST_CALL
@@ -64,29 +62,25 @@ def rate_limit(min_interval=0.7):
         time.sleep(min_interval - (now - _LAST_CALL))
     _LAST_CALL = time.time()
 
-
-def normalize_json(text: str) -> dict:
-    """
-    Strict JSON parsing only
-    """
+# ======================================================
+# SAFE JSON PARSER
+# ======================================================
+def safe_json_load(text: str) -> dict:
     text = text.strip()
-
     if text.startswith("```"):
         parts = text.split("```")
         if len(parts) > 1:
             text = parts[1]
-
     try:
         return json.loads(text)
     except Exception:
         logging.error("❌ Invalid JSON returned by Gemini")
         return {}
 
-
+# ======================================================
+# DOCX → PDF
+# ======================================================
 def safe_docx_to_pdf(input_docx, output_dir):
-    if not os.path.exists(input_docx):
-        raise FileNotFoundError("DOCX not found")
-
     result = subprocess.run(
         [
             LIBREOFFICE_PATH,
@@ -103,11 +97,10 @@ def safe_docx_to_pdf(input_docx, output_dir):
     )
 
     if result.returncode != 0:
-        raise RuntimeError("LibreOffice DOCX → PDF failed")
+        raise RuntimeError("DOCX → PDF failed")
 
     pdf_path = os.path.splitext(input_docx)[0] + ".pdf"
 
-    # wait until PDF is actually written
     for _ in range(10):
         if os.path.exists(pdf_path):
             return pdf_path
@@ -115,59 +108,86 @@ def safe_docx_to_pdf(input_docx, output_dir):
 
     raise RuntimeError("PDF not generated")
 
-
+# ======================================================
+# PDF → IMAGES
+# ======================================================
 def pdf_to_images(pdf_path):
     try:
         images = convert_from_path(pdf_path, poppler_path=POPPLER_PATH)
         paths = []
         for i, img in enumerate(images):
-            path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4()}_p{i}.png")
-            img.save(path, "PNG")
-            paths.append(path)
+            p = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4()}_{i}.png")
+            img.save(p, "PNG")
+            paths.append(p)
         return paths
     except Exception as e:
-        logging.error(f"❌ PDF → Image failed: {e}")
+        logging.error(f"PDF → image failed: {e}")
         return []
 
+# ======================================================
+# GEMINI MULTI‑PAGE + 2‑STEP EXTRACTION ✅
+# ======================================================
+JSON_REFORMAT_PROMPT = """
+Convert the following resume text into a VALID JSON OBJECT ONLY.
 
-# ======================================================
-# GEMINI MULTI-PAGE EXTRACTION (FIXED)
-# ======================================================
-def gemini_extract_multi(image_paths, system_prompt, user_prompt):
+Rules:
+- Output ONLY JSON
+- No markdown
+- No explanations
+- Use null if missing
+- skills must be array
+- educationalQualification must be array
+- Past Work Experience must be:
+  "Past Work Experience 1" to "Past Work Experience 4"
+
+Resume text:
+"""
+
+def gemini_extract_multi(image_paths):
     rate_limit()
 
-    images_payload = []
-    for p in image_paths:
-        with open(p, "rb") as f:
-            images_payload.append({
+    images = []
+    for path in image_paths:
+        with open(path, "rb") as f:
+            images.append({
                 "mime_type": "image/png",
                 "data": f.read()
             })
 
+    # -------- STEP 1: RAW TEXT EXTRACTION --------
     response = model.generate_content(
-        [system_prompt, *images_payload, user_prompt]
+        [cv_system_prompt, *images, cv_user_prompt]
     )
 
     if not response or not response.candidates:
-        logging.warning("⚠ Gemini returned no candidates")
         return {}
 
-    content = response.candidates[0].content
-    if not content or not content.parts:
-        return {}
+    raw_text = ""
+    for part in response.candidates[0].content.parts:
+        if hasattr(part, "text"):
+            raw_text += part.text
 
-    raw_text = "".join(
-        p.text for p in content.parts if hasattr(p, "text") and p.text
-    ).strip()
-
+    raw_text = raw_text.strip()
     if not raw_text:
         return {}
 
-    return normalize_json(raw_text)
+    # -------- STEP 2: CONVERT TO JSON --------
+    response_json = model.generate_content(
+        [JSON_REFORMAT_PROMPT + raw_text]
+    )
 
+    if not response_json or not response_json.candidates:
+        return {}
+
+    json_text = ""
+    for part in response_json.candidates[0].content.parts:
+        if hasattr(part, "text"):
+            json_text += part.text
+
+    return safe_json_load(json_text)
 
 # ======================================================
-# CV API
+# CV ENDPOINT
 # ======================================================
 @app.route("/cv", methods=["POST"])
 def extract_cv():
@@ -194,19 +214,16 @@ def extract_cv():
         else:
             return jsonify({"error": "Only PDF or DOCX supported"}), 400
     except Exception as e:
-        return jsonify({"error": f"File conversion failed: {e}"}), 400
+        return jsonify({"error": str(e)}), 400
 
     image_paths = pdf_to_images(pdf_path)
     if not image_paths:
-        return jsonify({"error": "Unable to read PDF pages"}), 400
+        return jsonify({"error": "Unreadable PDF"}), 400
 
     logging.info(f"Processing {filename} | pages={len(image_paths)}")
 
-    json_data = gemini_extract_multi(
-        image_paths, cv_system_prompt, cv_user_prompt
-    )
-
-    if not isinstance(json_data, dict):
+    json_data = gemini_extract_multi(image_paths)
+    if not json_data:
         return jsonify({"error": "Extraction failed"}), 500
 
     combined_data = {
@@ -230,25 +247,13 @@ def extract_cv():
     for i in range(1, 5):
         exp = json_data.get(f"Past Work Experience {i}")
         if isinstance(exp, dict) and any(exp.values()):
-            combined_data["pastWorkExperience"].append({
-                "jobTitle": exp.get("jobTitle"),
-                "company": exp.get("company"),
-                "duration": exp.get("duration"),
-                "description": exp.get("description"),
-            })
+            combined_data["pastWorkExperience"].append(exp)
 
-    if isinstance(json_data.get("educationalQualification"), list):
-        for edu in json_data["educationalQualification"]:
-            if isinstance(edu, dict) and any(edu.values()):
-                combined_data["educationalQualification"].append({
-                    "level": edu.get("level"),
-                    "institution": edu.get("institution"),
-                    "year": edu.get("year"),
-                    "details": edu.get("details"),
-                })
+    for edu in json_data.get("educationalQualification", []):
+        if isinstance(edu, dict) and any(edu.values()):
+            combined_data["educationalQualification"].append(edu)
 
     return jsonify({"extracted_data": [combined_data]}), 200
-
 
 # ======================================================
 # RUN
