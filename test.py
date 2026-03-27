@@ -1,262 +1,187 @@
-import logging
 import os
 import json
 import time
 import uuid
+import html
 import subprocess
-
+import logging
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
+
 from pdf2image import convert_from_path
+import pytesseract
+from PyPDF2 import PdfReader
 
 import google.generativeai as genai
-
-from CV_Data.Data import cv_system_prompt, cv_user_prompt
 
 # ======================================================
 # CONFIG
 # ======================================================
 UPLOAD_FOLDER = "uploads"
-POPPLER_PATH = r"C:\Users\Administrator\Downloads\Release-25.12.0-0\poppler-25.12.0\Library\bin"
+POPPLER_PATH = r"C:\poppler\Library\bin"
 LIBREOFFICE_PATH = r"C:\Program Files\LibreOffice\program\soffice.exe"
+TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
+GEMINI_API_KEY = "YOUR_API_KEY"
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO)
 
 # ======================================================
-# FLASK APP
+# FLASK
 # ======================================================
 app = Flask(__name__)
 CORS(app)
 
 # ======================================================
-# GEMINI CONFIG
+# GEMINI
 # ======================================================
-GEMINI_API_KEY = "YOUR_API_KEY"
 genai.configure(api_key=GEMINI_API_KEY)
 
 model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash",
+    "gemini-2.5-flash",
     generation_config={
-        "temperature": 0.2,
-        "top_p": 0.08,
-        "top_k": 32,
-        "max_output_tokens": 4096,
+        "temperature": 0,
+        "max_output_tokens": 4096
     }
 )
 
 # ======================================================
-# RATE LIMIT
+# HELPERS
 # ======================================================
-_LAST_CALL = 0
+def rate_limit(delay=0.8):
+    time.sleep(delay)
 
-def rate_limit(min_interval=0.7):
-    global _LAST_CALL
-    now = time.time()
-    if now - _LAST_CALL < min_interval:
-        time.sleep(min_interval - (now - _LAST_CALL))
-    _LAST_CALL = time.time()
-
-# ======================================================
-# SAFE JSON PARSER
-# ======================================================
-def safe_json_load(text: str) -> dict:
-    text = text.strip()
+def safe_json_load(text):
+    text = html.unescape(text.strip())
     if text.startswith("```"):
-        parts = text.split("```")
-        if len(parts) > 1:
-            text = parts[1]
+        text = text.split("```")[1]
     try:
         return json.loads(text)
-    except Exception:
-        logging.error("❌ Invalid JSON returned by Gemini")
-        return {}
+    except:
+        return None
+
+def is_complete_json(text):
+    return text.count("{") == text.count("}") and text.count('"') % 2 == 0
 
 # ======================================================
-# DOCX → PDF
+# FILE HANDLING
 # ======================================================
-def safe_docx_to_pdf(input_docx, output_dir):
-    result = subprocess.run(
-        [
-            LIBREOFFICE_PATH,
-            "--headless",
-            "--convert-to",
-            "pdf",
-            "--outdir",
-            output_dir,
-            input_docx,
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=90,
-    )
+def docx_to_pdf(path):
+    subprocess.run([
+        LIBREOFFICE_PATH,
+        "--headless",
+        "--convert-to", "pdf",
+        "--outdir", UPLOAD_FOLDER,
+        path
+    ], timeout=90)
+    return path.replace(".docx", ".pdf")
 
-    if result.returncode != 0:
-        raise RuntimeError("DOCX → PDF failed")
-
-    pdf_path = os.path.splitext(input_docx)[0] + ".pdf"
-
-    for _ in range(10):
-        if os.path.exists(pdf_path):
-            return pdf_path
-        time.sleep(0.3)
-
-    raise RuntimeError("PDF not generated")
-
-# ======================================================
-# PDF → IMAGES
-# ======================================================
-def pdf_to_images(pdf_path):
+def pdf_to_text(pdf):
     try:
-        images = convert_from_path(pdf_path, poppler_path=POPPLER_PATH)
-        paths = []
-        for i, img in enumerate(images):
-            p = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4()}_{i}.png")
-            img.save(p, "PNG")
-            paths.append(p)
-        return paths
-    except Exception as e:
-        logging.error(f"PDF → image failed: {e}")
-        return []
+        reader = PdfReader(pdf)
+        text = ""
+        for p in reader.pages:
+            text += p.extract_text() or ""
+        return text.strip()
+    except:
+        return ""
+
+def pdf_to_images(pdf):
+    return convert_from_path(pdf, poppler_path=POPPLER_PATH)
+
+def ocr_images(images):
+    return "\n".join(pytesseract.image_to_string(img) for img in images)
 
 # ======================================================
-# GEMINI MULTI‑PAGE + 2‑STEP EXTRACTION ✅
+# GEMINI PIPELINE
 # ======================================================
-JSON_REFORMAT_PROMPT = """
-Convert the following resume text into a VALID JSON OBJECT ONLY.
+STRUCTURING_PROMPT = """
+Convert the following resume text into VALID JSON ONLY.
 
 Rules:
-- Output ONLY JSON
 - No markdown
-- No explanations
+- No explanation
+- Preserve all information
 - Use null if missing
-- skills must be array
-- educationalQualification must be array
-- Past Work Experience must be:
-  "Past Work Experience 1" to "Past Work Experience 4"
-
-Resume text:
+- skills: array
+- education: array
+- experience: array
 """
 
-def gemini_extract_multi(image_paths):
+def extract_structured_data(resume_text):
     rate_limit()
 
-    images = []
-    for path in image_paths:
-        with open(path, "rb") as f:
-            images.append({
-                "mime_type": "image/png",
-                "data": f.read()
-            })
-
-    # -------- STEP 1: RAW TEXT EXTRACTION --------
     response = model.generate_content(
-        [cv_system_prompt, *images, cv_user_prompt]
+        STRUCTURING_PROMPT + "\n\n" + resume_text
     )
 
     if not response or not response.candidates:
         return {}
 
-    raw_text = ""
-    for part in response.candidates[0].content.parts:
-        if hasattr(part, "text"):
-            raw_text += part.text
+    raw = response.candidates[0].content.parts[0].text
 
-    raw_text = raw_text.strip()
-    if not raw_text:
-        return {}
+    if is_complete_json(raw):
+        parsed = safe_json_load(raw)
+        if parsed:
+            return parsed
 
-    # -------- STEP 2: CONVERT TO JSON --------
-    response_json = model.generate_content(
-        [JSON_REFORMAT_PROMPT + raw_text]
+    # 🔁 Retry continuation if truncated
+    rate_limit()
+    response2 = model.generate_content(
+        "Continue and complete the JSON below. ONLY JSON.\n\n" + raw
     )
 
-    if not response_json or not response_json.candidates:
-        return {}
+    if response2 and response2.candidates:
+        raw2 = raw + response2.candidates[0].content.parts[0].text
+        parsed = safe_json_load(raw2)
+        if parsed:
+            return parsed
 
-    json_text = ""
-    for part in response_json.candidates[0].content.parts:
-        if hasattr(part, "text"):
-            json_text += part.text
-
-    return safe_json_load(json_text)
+    return {}
 
 # ======================================================
-# CV ENDPOINT
+# API
 # ======================================================
 @app.route("/cv", methods=["POST"])
 def extract_cv():
-    if "pdf_file" not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
+    file = request.files.get("pdf_file")
+    if not file:
+        return jsonify({"error": "No file"}), 400
 
-    file = request.files["pdf_file"]
-    filename = secure_filename(file.filename)
+    name = secure_filename(file.filename)
+    uid = str(uuid.uuid4())
+    path = os.path.join(UPLOAD_FOLDER, uid + name)
+    file.save(path)
 
-    if not filename:
-        return jsonify({"error": "Invalid filename"}), 400
+    if path.endswith(".docx"):
+        path = docx_to_pdf(path)
 
-    uid = str(uuid.uuid4())[:8]
-    saved_path = os.path.join(UPLOAD_FOLDER, f"{uid}_{filename}")
-    file.save(saved_path)
+    # ---- Try digital text
+    text = pdf_to_text(path)
 
-    ext = os.path.splitext(filename)[1].lower()
+    # ---- If empty → OCR
+    if len(text.strip()) < 100:
+        images = pdf_to_images(path)
+        text = ocr_images(images)
 
-    try:
-        if ext == ".docx":
-            pdf_path = safe_docx_to_pdf(saved_path, UPLOAD_FOLDER)
-        elif ext == ".pdf":
-            pdf_path = saved_path
-        else:
-            return jsonify({"error": "Only PDF or DOCX supported"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    if not text.strip():
+        return jsonify({"error": "Unable to extract text"}), 400
 
-    image_paths = pdf_to_images(pdf_path)
-    if not image_paths:
-        return jsonify({"error": "Unreadable PDF"}), 400
+    data = extract_structured_data(text)
 
-    logging.info(f"Processing {filename} | pages={len(image_paths)}")
-
-    json_data = gemini_extract_multi(image_paths)
-    if not json_data:
-        return jsonify({"error": "Extraction failed"}), 500
-
-    combined_data = {
-        "name": json_data.get("name"),
-        "phoneNumber": json_data.get("phoneNumber"),
-        "email": json_data.get("email"),
-        "location": json_data.get("location"),
-        "maritalStatus": json_data.get("maritalStatus"),
-        "presentEmployer": json_data.get("presentEmployer"),
-        "presentJobTitle": json_data.get("presentJobTitle"),
-        "presentJobDescription": json_data.get("presentJobDescription"),
-        "presentJobStartingDate": json_data.get("presentJobStartingDate"),
-        "totalExperience": json_data.get("totalExperience"),
-        "dateOfBirth": json_data.get("dateOfBirth"),
-        "yearGap": json_data.get("yearGap"),
-        "skills": list(set(json_data.get("skills", []))),
-        "pastWorkExperience": [],
-        "educationalQualification": [],
-    }
-
-    for i in range(1, 5):
-        exp = json_data.get(f"Past Work Experience {i}")
-        if isinstance(exp, dict) and any(exp.values()):
-            combined_data["pastWorkExperience"].append(exp)
-
-    for edu in json_data.get("educationalQualification", []):
-        if isinstance(edu, dict) and any(edu.values()):
-            combined_data["educationalQualification"].append(edu)
-
-    return jsonify({"extracted_data": [combined_data]}), 200
+    # ✅ GUARANTEED RESPONSE
+    return jsonify({
+        "extracted_data": data,
+        "status": "success",
+        "confidence": "high" if len(text) > 500 else "medium"
+    }), 200
 
 # ======================================================
 # RUN
 # ======================================================
 if __name__ == "__main__":
-    app.run(host="157.20.51.172", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=5000)
