@@ -382,3 +382,245 @@ if __name__ == '__main__':
     app.run(debug=False, host='157.20.51.93', port=5001, use_reloader=False)
 
 
+---------------------------------------------------------------------
+
+
+
+
+
+import win32com
+from api_manager import api_manager
+from flask import Flask, request, jsonify, render_template, redirect, url_for, send_file
+import os
+import json
+import csv
+import time
+import subprocess
+import pythoncom
+
+from pdf2image import convert_from_path
+from docx2pdf import convert as docx_to_pdf
+import google.generativeai as genai
+
+models = list(genai.list_models())
+for m in models:
+    print(m.name)
+
+
+# ======================================================
+# 🔒 GEMINI CONFIG — ENV ONLY (NO HARDCODED KEYS)
+# ======================================================
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+
+print("🔥 GEMINI KEY PREFIX IN USE:",
+      GEMINI_KEY[:6] if GEMINI_KEY else "NONE")
+
+if not GEMINI_KEY:
+    raise RuntimeError("GEMINI_API_KEY not found in environment")
+
+genai.configure(api_key=GEMINI_KEY)
+# ======================================================
+
+
+MODEL_CONFIG = {
+    "temperature": 0.2,
+    "top_p": 0.08,
+    "top_k": 32,
+    "max_output_tokens": 40960,
+}
+
+model = genai.GenerativeModel(
+    model_name="gemini-2.5-flash",
+    generation_config=MODEL_CONFIG,
+    safety_settings=[
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    ]
+)
+
+# ======================================================
+# FLASK SETUP
+# ======================================================
+app = Flask(__name__)
+
+UPLOAD_FOLDER = "uploads"
+JSON_FILE = "cv_combined_data.json"
+CSV_FILE = "cv_combined_data.csv"
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+POPPLER_PATH = r"C:\Program Files (x86)\poppler-24.08.0\Library\bin"
+
+
+# ======================================================
+# RATE LIMITER (PREVENTS 429)
+# ======================================================
+_LAST_CALL = 0
+
+def _rate_limit(min_interval=0.7):
+    global _LAST_CALL
+    elapsed = time.time() - _LAST_CALL
+    if elapsed < min_interval:
+        time.sleep(min_interval - elapsed)
+    _LAST_CALL = time.time()
+# ======================================================
+
+
+# ======================================================
+# PDF → IMAGE
+# ======================================================
+def pdf_to_image_cv(pdf_path):
+    images = convert_from_path(pdf_path, poppler_path=POPPLER_PATH)
+    image_paths = []
+
+    for i, image in enumerate(images):
+        image_path = os.path.join(UPLOAD_FOLDER, f"temp_image_{i}.png")
+        image.save(image_path, "PNG")
+        image_paths.append(image_path)
+
+    return image_paths
+
+
+# ======================================================
+# IMAGE PAYLOAD
+# ======================================================
+def image_format(image_path):
+    with open(image_path, "rb") as img_file:
+        return {
+            "mime_type": "image/png",
+            "data": img_file.read()
+        }
+
+
+# ======================================================
+# GEMINI CALL (SAFE, RETURNS None ON FAILURE)
+# ======================================================
+def gemini_output_cv(image_path, system_prompt, user_prompt):
+    try:
+        _rate_limit()
+
+        response = model.generate_content([
+            system_prompt,
+            image_format(image_path),
+            user_prompt
+        ])
+
+        if not response or not getattr(response, "text", None):
+            print("⚠️ Empty Gemini response")
+            return None
+
+        raw_output = response.text.strip()
+
+        # Clean ```json blocks
+        if raw_output.startswith("```"):
+            raw_output = raw_output.strip("`").strip()
+            if raw_output.lower().startswith("json"):
+                raw_output = raw_output[4:].strip()
+
+        if not raw_output.startswith("{"):
+            print("⚠️ Gemini response not JSON")
+            return None
+
+        return raw_output
+
+    except Exception as e:
+        print(f"[GEMINI ERROR] {e}")
+        return None
+
+
+# ======================================================
+# SAVE CSV
+# ======================================================
+def cv_save_to_csv(data, output_path):
+    if not data:
+        return
+
+    headers = set()
+    for entry in data:
+        headers.update(entry.keys())
+
+    headers = list(headers)
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        for row in data:
+            writer.writerow(row)
+
+
+# ======================================================
+# LOAD EXISTING JSON
+# ======================================================
+def load_existing_json(json_path):
+    if not os.path.exists(json_path):
+        return []
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+# ======================================================
+# DOCX → PDF (SAFE)
+# ======================================================
+def safe_docx_to_pdf(docx_path, pdf_path):
+    output_dir = os.path.dirname(pdf_path)
+
+    result = subprocess.run(
+        [
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            "--headless",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            output_dir,
+            docx_path
+        ],
+        capture_output=True
+    )
+
+    time.sleep(1)
+
+    generated_pdf = os.path.join(
+        output_dir,
+        os.path.splitext(os.path.basename(docx_path))[0] + ".pdf"
+    )
+
+    if not os.path.exists(generated_pdf):
+        raise RuntimeError(
+            f"PDF not created.\nLibreOffice error:\n{result.stderr.decode(errors='ignore')}"
+        )
+
+    if os.path.exists(pdf_path):
+        os.remove(pdf_path)
+
+    os.rename(generated_pdf, pdf_path)
+
+
+# ======================================================
+# EXAMPLE PROCESS FLOW (SAFE JSON PARSING)
+# ======================================================
+def process_cv_pages(image_paths, system_prompt, user_prompt):
+    extracted_data = []
+
+    for img in image_paths:
+        raw = gemini_output_cv(img, system_prompt, user_prompt)
+
+        if raw is None:
+            continue
+
+        try:
+            parsed = json.loads(raw)
+            extracted_data.append(parsed)
+        except json.JSONDecodeError as e:
+            print("⚠️ JSON parse failed:", e)
+            continue
+
+    return extracted_data
+
+
