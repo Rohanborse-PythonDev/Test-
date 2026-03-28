@@ -58,4 +58,327 @@ app.logger.info("Calling Gemini extraction")
 app.logger.info("Extraction completed successfully")
 
 
+-------------------------------------------------------
+
+
+
+
+import json, os, logging
+import traceback
+import uuid
+from flask_cors import CORS
+import pandas as pd
+from werkzeug.utils import secure_filename
+from docx2pdf import convert as docx_to_pdf
+# from AVG_Graphs.Linmar_avg_Graphs import LiAVG_GRAPHS_build_current_summary, LiAVG_GRAPHS_get_connection
+from CV_Data.Data_Base_Store import call_cv_candidate_function
+from CV_Data.Data import cv_system_prompt, cv_user_prompt
+from KYC_doc.kyc_Main import process_file, save_data_to_db
+from flask import Flask, request, jsonify, session, Response
+from Ebill.ebill_Main import ebill_gemini_output, ebill_pdf_to_image
+from CV_Data.cv_main import pdf_to_image_cv, gemini_output_cv, safe_docx_to_pdf
+from invoice_po.po_Main import fetch_po_details, compare_data, trim_and_convert, po_pdf_to_image, po_gemini_output
+# from Linamar_MITS.Linamar_MITS import Linamar_image_format, Linamar_po_pdf_to_image, Linamar_po_word_to_image,Linamar_po_gemini_output
+
+
+app = Flask(__name__)
+app.secret_key = 'your_secret_key'
+UPLOAD_FOLDER = 'uploads'
+app.config['UPLOAD_FOLDER'] = os.path.join(app.root_path, 'static/uploads')
+CORS(app)
+if not os.path.exists(app.config['UPLOAD_FOLDER']):
+    os.makedirs(app.config['UPLOAD_FOLDER'])
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+LOG_FILE = os.path.join(app.root_path, 'app.log')
+logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+@app.route('/')
+def index():
+    app.logger.info('Accessed the homepage')
+    return jsonify({'message': 'API Started Sucessfully'}), 200
+# @app.route('/invoice', methods=['POST'])
+# def upload_invoice():
+#     app.logger.info('Invoice upload API accessed.')
+#     if 'file' not in request.files:
+#         return jsonify({'error': 'No file part'}), 400
+#
+#     file = request.files['file']
+#     if not file.filename.endswith('.pdf'):
+#         return jsonify({'error': 'Invalid file type. Only PDF files are allowed.'}), 400
+#
+#     filename = secure_filename(file.filename)
+#     pdf_path = os.path.join(app.root_path, app.config['UPLOAD_FOLDER'], filename)
+#     file.save(pdf_path)
+#     app.logger.info(f'Invoice PDF saved: {filename}')
+#
+#     try:
+#         image_paths = po_pdf_to_image(pdf_path)
+#         output_json = po_gemini_output(image_paths[0])
+#
+#         json_data = json.loads(output_json)
+#         po_number = trim_and_convert(json_data.get('poNumber', ''))
+#         db_data = fetch_po_details(po_number)
+#         comparison_results, product_comparisons = compare_data(json_data, db_data)
+#
+#         return jsonify({
+#             'comparison_results': comparison_results,
+#             'product_comparisons': product_comparisons
+#         }), 200
+#     except Exception as e:
+#         app.logger.error(f"Error processing invoice: {e}")
+#         return jsonify({'error': str(e)}), 500
+@app.route('/kyc', methods=['POST'])
+def upload_kyc_file():
+    app.logger.info('KYC file upload API accessed.')
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+
+    filename = secure_filename(file.filename)
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(file_path)
+    app.logger.info(f'KYC file saved: {filename}')
+
+    try:
+        extracted_data = process_file(file_path)
+        if not extracted_data:
+            return jsonify({'error': 'Failed to extract data from file.'}), 500
+
+        session['extracted_data'] = extracted_data
+        return jsonify({'extracted_data': extracted_data}), 200
+    except Exception as e:
+        app.logger.error(f"Error processing KYC file: {e}")
+        return jsonify({'error': str(e)}), 500
+# @app.route('/ebill', methods=['POST'])
+# def upload_electricity_bill():
+#     app.logger.info('Electricity bill upload API accessed.')
+#     if 'pdf_file' not in request.files:
+#         return jsonify({'error': 'No file part'}), 400
+#
+#     pdf_file = request.files['pdf_file']
+#     if pdf_file.filename == '':
+#         return jsonify({'error': 'No selected file'}), 400
+#
+#     filename = secure_filename(pdf_file.filename)
+#     pdf_path = os.path.join(UPLOAD_FOLDER, filename)
+#     pdf_file.save(pdf_path)
+#     app.logger.info(f'Electricity bill PDF saved: {filename}')
+#
+#     try:
+#         image_paths = ebill_pdf_to_image(pdf_path)
+#         output_json = ebill_gemini_output(image_paths)
+#         session['extracted_data'] = output_json
+#         return jsonify({'output_json': output_json}), 200
+#     except Exception as e:
+#         app.logger.error(f"Error processing electricity bill PDF: {e}")
+#         return jsonify({'error': str(e)}), 500
+@app.route('/cv', methods=['POST'])
+def cv_data_extraction():
+    if "pdf_file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    uploaded_file = request.files["pdf_file"]
+    if uploaded_file.filename == "":
+        return jsonify({"error": "No file selected"}), 400
+
+    filename = secure_filename(uploaded_file.filename)
+    ext = os .path.splitext(filename)[1].lower()
+
+    unique_id = str(uuid.uuid4())[:8]
+    base_filename = f"{os.path.splitext(filename)[0]}_{unique_id}"
+    file_path = os.path.join(UPLOAD_FOLDER, filename)
+
+    # Delete the file if it already exists
+    if os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except PermissionError:
+            return jsonify({"error": "File is locked or in use. Please try again after closing it."}), 500
+
+    # Save the uploaded file
+    try:
+        uploaded_file.save(file_path)
+    except PermissionError:
+        return jsonify({"error": "Permission denied when saving file. Please ensure it is not open."}), 500
+
+    # Convert DOCX to PDF if needed
+    if ext == ".docx":
+        pdf_path = os.path.join(UPLOAD_FOLDER, base_filename + ".pdf")
+        try:
+            safe_docx_to_pdf(file_path, pdf_path)
+            os.remove(file_path)  # Optionally delete the original .docx
+        except Exception as e:
+            return jsonify({"error": f"Failed to convert Word to PDF: {str(e)}"}), 500
+    elif ext == ".pdf":
+        pdf_path = file_path
+    else:
+        return jsonify({"error": "Unsupported file format. Only .pdf or .docx allowed."}), 400
+
+    try:
+        # Convert PDF to images (pages)
+        image_paths = pdf_to_image_cv(pdf_path)
+        combined_data = {
+            "name": None,
+            "phoneNumber": None,
+            "email": None,
+            "location": None,
+            "maritalStatus": None,
+            "presentEmployer": None,
+            "presentJobTitle": None,
+            "presentJobDescription": None,
+            "presentJobStartingDate": None,
+            "totalExperience": None,
+            "dateOfBirth": None,
+            "skills": [],
+            "pastWorkExperience": [],
+            "educationalQualification": [],
+            "yearGap":None
+        }  # Initialize with empty or None values
+
+        # Process each image (page)
+        for image_path in image_paths:
+            output_json = gemini_output_cv(image_path, cv_system_prompt, cv_user_prompt)
+
+            try:
+                json_data = json.loads(output_json)
+
+                # Combine data only if not already present
+                if json_data.get("name") and not combined_data["name"]:
+                    combined_data["name"] = json_data["name"]
+                if json_data.get("phoneNumber") and not combined_data["phoneNumber"]:
+                    combined_data["phoneNumber"] = json_data["phoneNumber"]
+                if json_data.get("email") and not combined_data["email"]:
+                    combined_data["email"] = json_data["email"]
+                if json_data.get("location") and not combined_data["location"]:
+                    combined_data["location"] = json_data["location"]
+                if json_data.get("maritalStatus") and not combined_data["maritalStatus"]:
+                    combined_data["maritalStatus"] = json_data["maritalStatus"]
+                if json_data.get("presentEmployer") and not combined_data["presentEmployer"]:
+                    combined_data["presentEmployer"] = json_data["presentEmployer"]
+                if json_data.get("presentJobTitle") and not combined_data["presentJobTitle"]:
+                    combined_data["presentJobTitle"] = json_data["presentJobTitle"]
+                if json_data.get("presentJobDescription") and not combined_data["presentJobDescription"]:
+                    combined_data["presentJobDescription"] = json_data["presentJobDescription"]
+                if json_data.get("presentJobStartingDate") and not combined_data["presentJobStartingDate"]:
+                    combined_data["presentJobStartingDate"] = json_data["presentJobStartingDate"]
+                if json_data.get("totalExperience") and not combined_data["totalExperience"]:
+                    combined_data["totalExperience"] = json_data["totalExperience"]
+                if json_data.get("dateOfBirth") and not combined_data["dateOfBirth"]:
+                    combined_data["dateOfBirth"] = json_data["dateOfBirth"]
+                if json_data.get("yearGap") and not combined_data["yearGap"]:
+                    combined_data["yearGap"] = json_data["yearGap"]
+
+                # Combine skills (ensure no duplicates)
+                if json_data.get("skills"):
+                    for skill in json_data["skills"]:
+                        if skill not in combined_data["skills"]:
+                            combined_data["skills"].append(skill)
+
+                # Combine past work experience
+                if json_data.get("Past Work Experience 1"):
+                    for i in range(1, 5):
+                        if json_data.get(f"Past Work Experience {i}"):
+                            past_work_exp = json_data[f"Past Work Experience {i}"]
+                            formatted_exp = {
+                                "company": past_work_exp.get("company"),
+                                "description": past_work_exp.get("description"),
+                                "duration": past_work_exp.get("duration"),
+                                "jobTitle": past_work_exp.get("jobTitle")
+                            }
+                            # Avoid duplicates in pastWorkExperience
+                            if formatted_exp not in combined_data["pastWorkExperience"]:
+                                combined_data["pastWorkExperience"].append(formatted_exp)
+
+                # Combine educational qualifications (ensure no duplicates)
+                if json_data.get("educationalQualification"):
+                    for qualification in json_data["educationalQualification"]:
+                        if qualification not in combined_data["educationalQualification"]:
+                            formatted_edu = {
+                                "details": qualification.get("details"),
+                                "institution": qualification.get("institution"),
+                                "level": qualification.get("level"),
+                                "year": qualification.get("year")
+                            }
+                            combined_data["educationalQualification"].append(formatted_edu)
+            # print(combined_data)
+            except json.JSONDecodeError as e:
+                print(f"Error parsing JSON for {image_path}: {e}")
+        # a = {"extracted_data": [combined_data]}
+        # call_cv_candidate_function(json.dumps(a))
+        # Return the combined data
+        print({"extracted_data": [combined_data]})
+        return jsonify({"extracted_data": [combined_data]}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+# @app.route('/Linamar_MITS', methods=['POST'])
+# def upload_linamar_invoice():
+#     app.logger.info('Linamar_MITS Invoice Upload API accessed.')
+#     if 'file' not in request.files:
+#         return jsonify({'error': 'No file part'}), 400
+#
+#     files = request.files.getlist('file')
+#     image_paths = []
+#
+#     for file in files:
+#         filename = secure_filename(file.filename)
+#         file_ext = filename.rsplit('.', 1)[-1].lower()
+#         file_path = os.path.join(app.root_path, app.config['UPLOAD_FOLDER'], filename)
+#         file.save(file_path)
+#         app.logger.info(f'Invoice file saved: {filename}')
+#
+#         if file_ext == 'pdf':
+#             image_paths.extend(Linamar_po_pdf_to_image(file_path))  # Process all pages
+#         elif file_ext in ['png', 'jpg', 'jpeg']:
+#             image_paths.append(file_path)  # Directly use image file
+#         elif file_ext in ['doc', 'docx']:
+#             image_paths.extend(Linamar_po_word_to_image(file_path))  # Convert Word to image
+#         else:
+#             return jsonify({'File_Type_Not_Supported': 'You have to upload PDF, image, or Word document'}), 400
+#
+#     try:
+#         output_json = Linamar_po_gemini_output(image_paths)
+#         linamar_json_data = json.loads(output_json)
+#         print(linamar_json_data)
+#         return jsonify(linamar_json_data), 200
+#     except Exception as e:
+#         return jsonify({'error': str(e)}), 500
+# @app.route("/api/current-summary", methods=["GET"])
+# def current_summary_api():
+#     try:
+#         conn = LiAVG_GRAPHS_get_connection()
+#         start_date = '2024-12-01'
+#
+#         df_main = pd.read_sql_query(
+#             "SELECT datetime_recvd, current_r, current_y, current_b FROM public.linamar_pune_data WHERE datetime_recvd >= %s",
+#             conn, params=(start_date,)
+#         )
+#         df_main['timestamp'] = pd.to_datetime(df_main['datetime_recvd'])
+#         df_main.dropna(subset=['timestamp'], inplace=True)
+#
+#         df_avg = pd.read_sql_query("SELECT date, current_x, current_y, current_z FROM public.linamar_month_data", conn)
+#         df_avg['date'] = pd.to_datetime(df_avg['date'], format='%m-%Y')
+#         conn.close()
+#
+#         # Change here for R/Y/B phase
+#         result = {
+#             "phase_r": LiAVG_GRAPHS_build_current_summary(df_main, df_avg, 'current_r', 'current_x'),
+#             "phase_y": LiAVG_GRAPHS_build_current_summary(df_main, df_avg, 'current_y', 'current_y'),
+#             "phase_b": LiAVG_GRAPHS_build_current_summary(df_main, df_avg, 'current_b', 'current_z'),
+#         }
+#
+#         return jsonify(result)
+#
+#     except Exception as e:
+#         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+if __name__ == '__main__':
+    # app.run(debug=True)
+    app.run(debug=False, host='157.20.51.93', port=5001, use_reloader=False)
+
 
