@@ -11,3 +11,51 @@
   "presentJobTitle": "Supply Chain Coordinator & Warehouse Manager",
   "presentJobDescription": "Directed end-to-end supply chain operations for 20+ retail outlets and wholesale channels, supporting $15M+ annual revenue and achieving a 98% OTIF delivery rate.\nManaged inventory valued at $5M+, optimizing turnover to 7.5x annually, achieving 99.5% accuracy, and freeing up $500K in working capital through improved stock control
 2026-03-27 17:31:49,525 [INFO] 157.20.51.172 - - [27/Mar/2026 17:31:49] "POST /cv HTTP/1.1" 200 -
+
+-------------------------------------------------------------
+
+import logging
+import sys
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+
+------------------------------------------------------------
+
+
+app.logger.info("Processing resume")
+
+-----------------------------------------------------------------
+
+
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=True,          # ✅ REQUIRED FOR LOG VISIBILITY
+        use_reloader=False   # ✅ Prevents duplicate logs
+    )
+
+---------------------------------------------------
+
+
+
+
+app.logger.info("CV endpoint called")
+
+app.logger.info(f"Uploaded file: {filename}")
+
+app.logger.info(f"PDF pages converted: {len(image_paths)}")
+
+app.logger.info("Calling Gemini extraction")
+
+app.logger.info("Extraction completed successfully")
+
+
+
