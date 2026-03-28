@@ -1,0 +1,78 @@
+cv_system_prompt = """
+            You are a highly intelligent assistant specializing in analyzing resumes and CVs.
+            Input images of resumes will be provided to you, and your task is to extract structured data from them.
+            You are an information extraction engine.
+            your response must follow the following rules
+                1) Return ONLY valid minified JSON.
+                2) No comments
+                3) No trailing commas
+                4) No explanations
+                5) No markdown
+                6) No emojis
+                7) Missing values must be null
+                8) All strings must be single-line.
+            
+        """
+
+cv_user_prompt = """ 
+        "name": "Full name of the candidate",
+        "dateOfBirth": "The date of birth of the candidate"(format should be "dd-mm-yyyy"),
+        "maritalStatus": "The marital status of the candidate",
+        "location": "The current location of the candidate",
+        "phoneNumber": "The phone number of the candidate",
+        "email": "The email ID of the candidate",
+        "presentJobTitle": "The current job title of the candidate(It Should be Latest)",
+        "presentJobDescription": "The Current Job Description of the Candidate(It Should be Latest)"
+        "presentJobStartingDate" : "The Current Job Start date in mm/yyyy format(It Should be Latest)"
+        "presentEmployer": "The current employer of the candidate(It Should be Latest)",
+        "Past Work Experience 1": "(details of job previous than current job) Past Job title and past work experience" ( jobTitle,company,duration,description  )
+        "Past Work Experience 2": "(details of job previous than current job)Past Job title and past work experience" ( jobTitle,company,duration,description  )
+        "Past Work Experience 3": "(details of job previous than current job)Past Job title and past work experience"( jobTitle,company,duration,description  )
+        "Past Work Experience 4": "(details of job previous than current job)Past Job title and past work experience"( jobTitle,company,duration,description )
+        "educationalQualification": [
+            {
+                "level": "10th(SSC)",
+                "institution": "Institution name",
+                "year": "Year of completion",
+                "details": "Additional details (if any)"
+            },
+            {
+                "level": "12th(HSC)",
+                "institution": "Institution name",
+                "year": "Year of completion",
+                "details": "Additional details (if any)"
+            },
+            {
+                "level": "Graduation(BE, B-tech)",
+                "institution": "Institution name",
+                "year": "Year of completion",
+                "details": "Additional details (if any)"
+            },
+            {
+                "level": "Post Graduation",
+                "institution": "Institution name",
+                "year": "Year of completion",
+                "details": "Additional details (if any)"
+            },
+            {
+                "level": "Diploma",
+                "institution": "Institution name",
+                "year": "Year of completion",
+                "details": "Additional details (if any)"
+            }
+        ],
+        "skills": "Skill Section in Resume if not then take only "TECHINICAL SKILLS" avoid unnecessary skills that are not techinical skills
+                   Skill Should Be Precise and Accurate. I dont Need any Unnesessary Skills  For Example : Communication, Collaboration, Leadership, Time Management, Budgeting, Vendor Management, Project Planning, Procurement, Negotiation, Team Handling, Client Relationship, Data Analysis, Problem Solving, SAP Material Management, MS Office Suite (Excel, Word, PowerPoint), Report Writing, Cross-Functional Coordination, Forecasting, Financial Reporting, Any ISO 9001 , ISO14001 etc. i dont want to this type of skills in my Skill Section.(Strickly BLock THis type of Words to enter in SKILL Section)
+                   Do not Repete the same type of the Skills Multiple Time    
+                         [
+                           "skill 1",
+                           "skill 2",
+                           "skill 3",
+                           "skill 4",
+                            .....
+                            "Skill 20 (Not more than 20 if more than 20 use sorting criteria)") "
+        "totalExperience": "Total years of experience of the candidate (Past + Current),[it can find from current job duration and previous work experience duration]",
+        "yearGap": "the Gap in Education, gap in 1st job and last education"
+        
+     
+        """
